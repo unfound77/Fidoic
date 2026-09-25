@@ -1,0 +1,12 @@
+{
+  "name": "fidoic-tests",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Mocked Zotero/DOM/network test harness for fidoic's bootstrap.js. No build step for the plugin itself; this is dev-only tooling.",
+  "scripts": {
+    "test": "node tests/fidoic.test.js"
+  },
+  "devDependencies": {
+    "jsdom": "^24.0.0"
+  }
+}
