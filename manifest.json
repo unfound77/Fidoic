@@ -1,0 +1,19 @@
+{
+  "manifest_version": 2,
+  "name": "fidoic",
+  "version": "0.4.0",
+  "description": "fidoic: a docked reading companion for the PDF open in Zotero. Reads the paper automatically. Works with the free Gemini API tier or with Claude.",
+  "author": "fidoic",
+  "icons": {
+    "48": "icon.svg",
+    "96": "icon.svg"
+  },
+  "applications": {
+    "zotero": {
+      "id": "fidoic@local.invalid",
+      "update_url": "https://updates.fidoic.invalid/update.json",
+      "strict_min_version": "6.999",
+      "strict_max_version": "10.*"
+    }
+  }
+}
