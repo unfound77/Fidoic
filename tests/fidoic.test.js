@@ -19,7 +19,7 @@ const prefs = {};
 const httpCalls = [];
 const fetchCalls = [];
 const registered = {};
-const mode = { cacheFails: false, rateLimit429: false, badCacheOnce: false, rejectThinking: false, geminiEvents: null, claudeEvents: null };
+const mode = { cacheFails: false, rateLimit429: false, unavailable: false, badCacheOnce: false, rejectThinking: false, geminiEvents: null, claudeEvents: null };
 
 function abortableDelay(ms, signal) {
   return new Promise((resolve, reject) => {
@@ -65,8 +65,11 @@ global.Zotero = {
 global.fetch = async (url, opts) => {
   const body = JSON.parse(opts.body);
   fetchCalls.push({ url, body, headers: opts.headers });
-  if (mode.rateLimit429 && url.includes("gemini-2.5-flash-lite:")) {
+  if (mode.rateLimit429 && url.includes("gemini-3.5-flash-lite:")) {
     return { ok: false, status: 429, body: null, text: async () => JSON.stringify({ error: { message: "Quota exceeded" } }) };
+  }
+  if (mode.unavailable && url.includes("gemini-2.5-flash-lite:")) {
+    return { ok: false, status: 404, body: null, text: async () => JSON.stringify({ error: { message: "This model models/gemini-2.5-flash-lite is no longer available to new users. Please update your code to use models/gemini-3.5-flash-lite." } }) };
   }
   if (mode.rejectThinking && body.generationConfig && body.generationConfig.thinkingConfig) {
     return { ok: false, status: 400, body: null, text: async () => JSON.stringify({ error: { message: "Thinking level is not supported for this model." } }) };
@@ -99,7 +102,7 @@ async function freshSession() {
   win = makeWin();
   prefs["extensions.fidoic.provider"] = undefined; delete prefs["extensions.fidoic.provider"];
   prefs["extensions.fidoic.geminiKey"] = "AIza-test";
-  mode.geminiEvents = null; mode.claudeEvents = null; mode.rateLimit429 = false; mode.badCacheOnce = false; mode.cacheFails = false; mode.rejectThinking = false;
+  mode.geminiEvents = null; mode.claudeEvents = null; mode.rateLimit429 = false; mode.badCacheOnce = false; mode.cacheFails = false; mode.rejectThinking = false; mode.unavailable = false;
   fetchCalls.length = 0; httpCalls.length = 0;
   await __b.startup({ id: "fidoic@local.invalid" });
   const d = win.document;
@@ -136,9 +139,9 @@ async function freshSession() {
   ok("streamed text assembled correctly", firstAnswer.includes("The letter arrives."));
   ok("thought summary is not part of the final answer", !firstAnswer.includes("Considering") && !d.querySelector(".fd-thinking"));
   ok("stop button hidden again after completion", d.querySelector(".fd-stop").style.display === "none");
-  ok("status reports how long the answer took", /^Answered in \d+s by gemini-2.5-flash-lite/.test(d.querySelector(".fd-status").textContent));
+  ok("status reports how long the answer took", /^Answered in \d+s by gemini-3.5-flash-lite/.test(d.querySelector(".fd-status").textContent));
   ok("gemini generationConfig used the configured token cap", gc1.body.generationConfig.maxOutputTokens === 2048);
-  ok("gemini 2.5 on low thinking sends a zero thinking budget", gc1.body.generationConfig.thinkingConfig.thinkingBudget === 0 && !gc1.body.generationConfig.thinkingConfig.thinkingLevel);
+  ok("gemini 3 on low thinking sends thinkingLevel low with summaries", gc1.body.generationConfig.thinkingConfig.thinkingLevel === "low" && gc1.body.generationConfig.thinkingConfig.includeThoughts === true && gc1.body.generationConfig.thinkingConfig.thinkingBudget === undefined);
 
   d.querySelector(".fd-compose textarea").value = "And why?";
   d.querySelector(".fd-compose .fd-send").click();
@@ -162,8 +165,8 @@ async function freshSession() {
   d.querySelector(".fd-compose .fd-send").click();
   await wait(80);
   mode.rateLimit429 = false;
-  ok("429 falls back to the lighter model", fetchCalls[fetchCalls.length - 1].url.includes("gemini-2.5-flash:"));
-  ok("status line names the fallback model", /Answered in \d+s by gemini-2.5-flash/.test(d.querySelector(".fd-status").textContent));
+  ok("429 falls back to the fallback model", fetchCalls[fetchCalls.length - 1].url.includes("gemini-3.5-flash:"));
+  ok("status line names the fallback model", /Answered in \d+s by gemini-3.5-flash/.test(d.querySelector(".fd-status").textContent));
 
   mode.geminiEvents = [{ candidates: [{ content: { parts: [{ text: "Partial " }] } }] }, "__HANG__"];
   d.querySelector(".fd-compose textarea").value = "Long one";
@@ -267,20 +270,44 @@ async function freshSession() {
   __b.shutdown();
   ok("session B cleans up", !d.getElementById("fd-root"));
 
-  // ===== SESSION C: old saved defaults migrate once; Gemini 3 models get a thinking level =====
-  for (const k of Object.keys(prefs)) delete prefs[k];
-  prefs["extensions.fidoic.geminiModel"] = "gemini-3.8-flash";
-  prefs["extensions.fidoic.geminiFallback"] = "gemini-3.5-flash-lite";
+  // ===== SESSION C: saved old defaults migrate once; unavailable model falls back =====
+  for (const [model, fb, ver] of [["gemini-3.8-flash", "gemini-3.5-flash-lite", undefined], ["gemini-2.5-flash-lite", "gemini-2.5-flash", 2]]) {
+    for (const k of Object.keys(prefs)) delete prefs[k];
+    prefs["extensions.fidoic.geminiModel"] = model;
+    prefs["extensions.fidoic.geminiFallback"] = fb;
+    if (ver) prefs["extensions.fidoic.prefsVersion"] = ver;
+    d = await freshSession();
+    ok("saved " + model + " defaults migrate to 3.5 Flash-Lite / 3.5 Flash", prefs["extensions.fidoic.geminiModel"] === "gemini-3.5-flash-lite" && prefs["extensions.fidoic.geminiFallback"] === "gemini-3.5-flash");
+    __b.shutdown();
+  }
+
+  // a model the user picks after migration is kept, and if Google refuses it, the fallback answers
+  prefs["extensions.fidoic.geminiModel"] = "gemini-2.5-flash-lite";
   d = await freshSession();
-  ok("saved old default models migrate to the free-tier defaults", prefs["extensions.fidoic.geminiModel"] === "gemini-2.5-flash-lite" && prefs["extensions.fidoic.geminiFallback"] === "gemini-2.5-flash");
+  ok("a model chosen after migration is left alone", prefs["extensions.fidoic.geminiModel"] === "gemini-2.5-flash-lite");
+  mode.unavailable = true;
+  d.querySelector(".fd-compose textarea").value = "Closed model?";
+  d.querySelector(".fd-compose .fd-send").click();
+  await wait(100);
+  ok("model closed to new users falls back instead of failing", fetchCalls[fetchCalls.length - 1].url.includes("gemini-3.5-flash:") && d.querySelectorAll(".fd-asst").length === 1 && /not available to this key \(gemini-2\.5-flash-lite\)\. Answered in \d+s by gemini-3\.5-flash/.test(d.querySelector(".fd-status").textContent));
+  mode.unavailable = false;
+  ok("gemini 2.5 on low thinking sends a zero thinking budget", fetchCalls[fetchCalls.length - 2].body.generationConfig.thinkingConfig.thinkingBudget === 0);
   __b.shutdown();
+
   prefs["extensions.fidoic.geminiModel"] = "gemini-3.8-flash";
   d = await freshSession();
-  ok("a model chosen after migration is left alone", prefs["extensions.fidoic.geminiModel"] === "gemini-3.8-flash");
+  mode.cacheFails = true; // this session's paper never gets a cache
   d.querySelector(".fd-compose textarea").value = "Level?";
   d.querySelector(".fd-compose .fd-send").click();
   await wait(80);
   const g3 = fetchCalls[fetchCalls.length - 1].body.generationConfig.thinkingConfig;
   ok("gemini 3 on low thinking sends thinkingLevel low with summaries", g3.thinkingLevel === "low" && g3.includeThoughts === true && g3.thinkingBudget === undefined);
+  for (const q of ["Too small?", "Still small?"]) {
+    d.querySelector(".fd-compose textarea").value = q;
+    d.querySelector(".fd-compose .fd-send").click();
+    await wait(80);
+  }
+  ok("a failed cache creation is not retried on every question", httpCalls.filter((c) => c.url.endsWith("/cachedContents")).length === 1 && fetchCalls.slice(-3).every((c) => !c.body.cachedContent && c.body.systemInstruction));
+  mode.cacheFails = false;
   __b.shutdown();
 })().catch((e) => { console.error("ERROR", e); process.exitCode = 1; });

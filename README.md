@@ -31,14 +31,21 @@ Requires Zotero 7, 8, 9, or 10.
   popup. If you had typed a question, it's answered against that passage. If the box was
   empty, fidoic explains what the passage is saying.
 - **Streams live.** Answers appear as they're generated, with a Stop button if you want to
-  cut one short — the partial answer is kept.
+  cut one short. The partial answer is kept. Before the first word arrives, the panel shows
+  what it is doing (reading, waiting, thinking) with a seconds counter, and for Gemini the
+  model's short thinking summaries.
+- **Shows the passage you asked about.** Your question appears under a quote of the
+  selected passage. Click the quote to see all of it.
 - **Your own prompts.** The buttons above the input box come from a list you set in
   settings (`Label | prompt`, one per line). With a passage selected, a button applies to
   the passage; otherwise it applies to the whole paper.
-- **Fast and cheap by default.** Gemini requests use context caching, so the paper's text
-  is uploaded and billed once per hour, not on every question. Claude requests use
-  Anthropic's prompt caching the same way. Default reply length and paper-text limits are
-  both kept modest and both adjustable in settings.
+- **Fast and cheap by default.** The default Gemini model is Gemini 3.5 Flash-Lite, on the
+  free tier, with thinking turned low. Gemini requests use context caching where the model
+  and tier allow it: the first
+  question about a paper sends its text directly while a cache is built in the background,
+  and later questions within the hour use the cache. Claude requests use Anthropic's prompt
+  caching. Default reply length and paper-text limits are both kept modest and both
+  adjustable in settings.
 - **Save as note / Copy** under each answer. Notes are labelled as AI-generated, with the
   model and date.
 - No compose or rewrite mode — this isn't a general writing tool, just a reading companion.
@@ -51,16 +58,21 @@ Gear icon in the panel:
 |---|---|
 | Provider | Gemini (free tier available) or Claude (paid API) |
 | API key | Stored in Zotero's own preferences, in plain text, on your machine only |
-| Model / Fallback model | Fallback is used automatically if the main Gemini model hits a 429 |
+| Model / Fallback model | Defaults: `gemini-3.5-flash-lite`, falling back to `gemini-3.5-flash` automatically if the main model hits a 429 or is not available to your key |
+| Gemini thinking | Low (default, fastest), medium, high, or the model's own default. Higher can be more careful but can take minutes on a long paper |
 | Prompt buttons | One per line, `Label \| the actual prompt` |
 | Max characters of paper text sent | Higher lets you ask about longer papers in full; lower is faster and cheaper |
 | Max reply length | In tokens; lower answers faster and costs less |
 
 ## Free-tier facts
 
-Checked against Google's own pages as of writing:
+Checked against Google's pricing page in September 2026:
 
-- Gemini 3.8/3.7/3.6/3.5 Flash and 3.5/3.1 Flash-Lite have free input and output tokens.
+- Free input and output tokens: Gemini 3.5 Flash-Lite and 3.5/3.6/3.7/3.8 Flash.
+- Free context caching: the 3.5 to 3.8 Flash models. Not 3.5 Flash-Lite, so on a free key
+  each question sends the paper text again (still free, just slower on long papers).
+- Gemini 2.5 models are only open to keys that used them before; new keys get "no longer
+  available to new users".
 - Free-tier requests may be used by Google to improve its products (paid keys are
   excluded). Keep unpublished or sensitive material off the free tier, or use a paid key /
   Claude instead.

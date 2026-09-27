@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.5.1
+- Default Gemini models are now `gemini-3.5-flash-lite`, falling back to `gemini-3.5-flash`.
+  0.5.0's defaults (the 2.5 models) are closed to new API keys and failed with "no longer
+  available to new users". 0.5.0 also wrongly said 3.5 Flash-Lite was not on the free tier;
+  it is, but without free context caching.
+- A main model that is not available to your key now falls back to the fallback model, the
+  same way a 429 does, and the status line says why.
+- Saved settings holding the 0.4.0 or 0.5.0 default models move to the new defaults once.
+
+## 0.5.0
+- The selected passage now shows in the question bubble, as a quote you can click to expand,
+  instead of "[Selected passage attached]".
+- The panel no longer looks frozen while waiting. The status line shows the current step
+  (reading, waiting, thinking, answering) with a seconds counter, the answer bubble shows
+  Gemini's thinking summaries as they arrive, and the finished status says how long the
+  answer took and whether the cached paper was used.
+- Default Gemini models changed to `gemini-2.5-flash-lite` with `gemini-2.5-flash` as
+  fallback. (Replaced in 0.5.1: new keys can't use 2.5 models.)
+- New "Gemini thinking" setting, low by default. Uses a thinking budget on Gemini 2.x and a
+  thinking level on Gemini 3.x. A model that rejects the setting is retried once without it.
+- The first question about a paper no longer waits for the Gemini cache to be created. It
+  sends the text directly and builds the cache in the background for later questions. A
+  failed cache creation is not retried for an hour.
+- If this Zotero build has no `fetch`, the status line now says so instead of silently
+  waiting for a buffered answer.
+
 ## 0.4.0
 - Answers now stream in as they're generated instead of arriving all at once.
 - A Stop button cancels a generation in progress and keeps whatever text already arrived.

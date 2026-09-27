@@ -93,7 +93,9 @@ but unverified.
 
 ## Providers: streaming, caching, fallback
 
-Both providers go through `streamAsk(d, chat, att, onDelta, signal)` in `bootstrap.js`.
+Both providers go through `streamAsk(d, chat, att, hooks, signal)` in `bootstrap.js`, where
+`hooks` is `{ onDelta(chunk, fullText), onThought(fullThoughtSummary), onPhase(label) }`. The
+UI uses these for the live status line (phase plus a seconds counter) and the thinking view.
 
 - **If `typeof fetch === "function"`** (expected on Zotero 7+, since Zotero's own
   `Zotero.HTTP.download()` is documented as having been "rewritten to stream via fetch()" in
@@ -109,10 +111,39 @@ Both providers go through `streamAsk(d, chat, att, onDelta, signal)` in `bootstr
 ### Gemini
 
 - Streaming endpoint: `POST .../models/{model}:streamGenerateContent?alt=sse`.
-- **Context caching**: on the first question about a given document+model combination,
-  `createGeminiCache()` POSTs to `.../v1beta/cachedContents` with the system prompt and full
-  document text, gets back a `cachedContents/...` name, and stores it in
-  `state.geminiCaches` keyed by `attachmentId:model:textLength` (the text length is in the
+- **Default models** (since 0.5.1): `gemini-3.5-flash-lite`, fallback `gemini-3.5-flash`.
+  Both free tier (checked against the raw pricing page HTML, September 2026). 3.5 Flash-Lite
+  has NO free context caching, so on a free key the background cache creation fails once an
+  hour and the paper goes inline; 3.5 Flash has free caching and a separate rate limit.
+- **Mistake already made once:** 0.5.0 defaulted to `gemini-2.5-flash-lite`/`gemini-2.5-flash`
+  because the pricing page lists them as free. Google closed all 2.5 models to keys that
+  never used them ("no longer available to new users", see the deprecations page), so a new
+  user got an error on the first question. Before changing a default model, check BOTH the
+  pricing page and the deprecations page, and read the raw page rather than trusting a
+  summary of it (an automated summary also wrongly said 3.5 Flash-Lite was paid only).
+- `fallbackReason()` sends a question to the fallback model on a 429 or when the main model
+  is unavailable to the key (404, or a "no longer available"/"not found" message).
+- `migratePrefs()` moves saved values equal to any earlier version's exact defaults
+  (`OLD_DEFAULTS`) to the current ones, once per `PREFS_VERSION` (now 3), because Save
+  writes the displayed model into prefs even if the user never chose it. Bump
+  `PREFS_VERSION` and add the outgoing defaults to `OLD_DEFAULTS` whenever defaults change.
+- **Thinking**: first live test (0.4.0, Zotero, Gemini 3.8 Flash) took over 5 minutes with no
+  visible activity. Gemini 3 thinks at a high level by default and thought parts were
+  filtered out, so the UI showed nothing. Now `geminiGenConfig()` sends `thinkingConfig`
+  from the "Gemini thinking" setting (default low): `thinkingBudget` for `gemini-2.*`
+  (0 turns it off on Flash/Flash-Lite, Pro's floor is 128), `thinkingLevel` for 3.x, and
+  `includeThoughts: true` so thought summaries stream and show in the live bubble. A 400
+  naming "think" retries once without `thinkingConfig` and adds the model to
+  `state.noThinking`. Note Gemini counts thinking tokens against `maxOutputTokens`; a
+  `MAX_TOKENS` finish with no text gets a specific error message.
+- **Context caching**: the first question about a given document+model combination does
+  NOT wait for a cache (it did in 0.4.0; cache creation was a buffered request with a long
+  timeout). `geminiCacheNow()` returns a cache name only if one is ready; otherwise it
+  starts `createGeminiCache()` in the background (`state.geminiCachePending` prevents
+  duplicates) and the question goes out with the paper inline. The cache POSTs to
+  `.../v1beta/cachedContents` with the system prompt and full document text, gets back a
+  `cachedContents/...` name, and stores it in `state.geminiCaches` keyed by
+  `attachmentId:model:textLength` (the text length is in the
   key so a settings change to the character limit naturally invalidates old cache entries
   without needing explicit bookkeeping). Subsequent questions about the same paper send
   `cachedContent: name` instead of re-sending the document. TTL is set to one hour
@@ -126,8 +157,9 @@ Both providers go through `streamAsk(d, chat, att, onDelta, signal)` in `bootstr
   no cache (a different model needs its own cache entry, and this is meant to be a rare
   escape hatch, not a steady-state path worth optimizing further).
 - Very short documents may be too small for Gemini to accept a cache; `createGeminiCache`
-  catches that and just returns `null`, so the plugin quietly falls back to sending the text
-  inline for that document, forever, without retrying the cache creation on every turn.
+  catches that and returns `null`, which is stored as a `{ name: null }` entry for the same
+  hour a cache would live, so the text goes inline and creation is not retried every turn.
+  (0.4.0 actually deleted the entry and retried every turn, despite what this file said.)
 
 ### Claude
 
@@ -162,15 +194,17 @@ wrong reason.
 - Prompt buttons are user-defined text parsed by `parsePrompts()` from a single settings
   textarea (`Label | prompt`, one per line). This was chosen over a fixed prompt list after
   the user specifically asked to supply their own prompts rather than use built-in ones.
+- The passage a question was asked about is stored on the user turn as `passage` and shown
+  as a clickable, collapsible `.fd-quote` above the question (0.4.0 only showed
+  "[Selected passage attached]", which the user found useless).
 - Selection handling: after a selection is used in a question, `state.selection = null` and
   the chip clears, because the selection now lives in that chat turn's history; carrying it
   forward would silently re-attach an old passage to unrelated later questions.
 
 ## Known open questions / things to verify in real Zotero before calling this done
 
-1. Does the docking (`#tabs-deck`, `margin-right`) actually look right in a real Zotero
-   window, across the reader and library views? Only ever seen in jsdom with a bare `<div
-   id="tabs-deck">`.
+1. Docking: confirmed fine in a real Zotero reader window (0.4.0 live test, September 2026).
+   Library view not yet checked.
 2. Does `fetch` actually exist in the bootstrap.js execution context on Zotero 7/8/9/10? See
    the streaming section above — this is inferred, not confirmed.
 3. Does Gemini's `cachedContents` creation actually succeed for a typical academic paper's
@@ -191,7 +225,7 @@ wrong reason.
 manifest.json              # the only two files that actually ship
 bootstrap.js
 icon.svg
-tests/fidoic.test.js       # mocked Zotero/DOM/network regression suite (26 checks)
+tests/fidoic.test.js       # mocked Zotero/DOM/network regression suite (45 checks)
 package.json               # dev-only, for running tests/fidoic.test.js
 .github/workflows/release.yml   # builds + releases the .xpi on a vX.Y.Z tag push
 README.md, CHANGELOG.md, LICENSE (MIT)

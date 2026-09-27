@@ -33,11 +33,12 @@ function createPlugin(pluginID) {
   const GEMINI_CACHE_TTL_SECONDS = 3600;
   const DEFAULTS = {
     provider: "gemini",
-    // Both on Gemini's free tier (with free context caching) as of September 2026. The earlier
-    // defaults were gemini-3.8-flash (free, but slow with thinking) and gemini-3.5-flash-lite
-    // (not on the free tier at all, so the 429 fallback could never succeed on a free key).
-    geminiModel: "gemini-2.5-flash-lite",
-    geminiFallback: "gemini-2.5-flash",
+    // Free tier as of September 2026 (Google's pricing page). 3.5 Flash-Lite is the fastest
+    // and is Google's pick for new keys, but its free tier has no context caching; 3.5 Flash
+    // has free caching and its own rate limit, so it is a useful fallback. Gemini 2.5 models
+    // are closed to keys that never used them, which is why 0.5.0's 2.5 defaults failed.
+    geminiModel: "gemini-3.5-flash-lite",
+    geminiFallback: "gemini-3.5-flash",
     claudeModel: "claude-sonnet-5",
     maxChars: 120000,
     maxOutputTokens: 2048,
@@ -49,13 +50,18 @@ function createPlugin(pluginID) {
       "Argument | Reconstruct the argument step by step. Quote the sentence that carries each step.",
   };
   const DEFAULT_EXPLAIN = "Explain what this passage is saying.";
-  // Free-tier models first; the last two are paid-only.
+  // All free tier; the 2.5 models only work for keys that used them before.
   const MODEL_SUGGESTIONS = [
-    "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-3.5-flash", "gemini-3.6-flash",
-    "gemini-3.7-flash", "gemini-3.8-flash", "gemini-2.5-pro",
-    "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.7-flash",
+    "gemini-3.8-flash", "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro",
   ];
-  const OLD_DEFAULTS = { geminiModel: "gemini-3.8-flash", geminiFallback: "gemini-3.5-flash-lite" };
+  // Defaults shipped by earlier versions (0.4.0, then 0.5.0). A saved value equal to one of
+  // these was almost certainly never chosen by the user, see migratePrefs().
+  const OLD_DEFAULTS = {
+    geminiModel: ["gemini-3.8-flash", "gemini-2.5-flash-lite"],
+    geminiFallback: ["gemini-3.5-flash-lite", "gemini-2.5-flash"],
+  };
+  const PREFS_VERSION = 3;
 
   const SYSTEM_PROMPT =
     "You are a reading companion for an academic researcher working through difficult texts in philosophy, psychoanalysis and theory. " +
@@ -467,13 +473,25 @@ function createPlugin(pluginID) {
     return text;
   }
 
+  // Worth trying the fallback model for: a rate limit, or the main model being unavailable
+  // to this key (retired, or closed to new users, as happened to the 2.5 models).
+  function fallbackReason(e) {
+    if (!e || e.partialText) return null;
+    if (e.status === 429) return "Main model hit its limit";
+    if (e.status === 404 || /no longer available|not found|is not supported|not available to/i.test(String(e.message || ""))) {
+      return "Main model is not available to this key";
+    }
+    return null;
+  }
+
   async function callGeminiBuffered({ apiKey, model, fallback, d, messages, maxOutputTokens }) {
     try {
       return { text: await geminiOnceBuffered({ apiKey, model, d, messages, maxOutputTokens }), model };
     } catch (e) {
-      if (e.status === 429 && fallback && fallback !== model) {
+      const why = fallbackReason(e);
+      if (why && fallback && fallback !== model) {
         const text = await geminiOnceBuffered({ apiKey, model: fallback, d, messages, maxOutputTokens });
-        return { text, model: fallback, usedFallback: true, primary: model };
+        return { text, model: fallback, usedFallback: why, primary: model };
       }
       throw e;
     }
@@ -524,10 +542,12 @@ function createPlugin(pluginID) {
         const text = await streamGeminiAttempt({ apiKey, model, cacheName: null, d, messages, maxOutputTokens, hooks, signal });
         return { text, model };
       }
-      if (e.status === 429 && fallback && fallback !== model && !e.partialText) {
-        hooks.onPhase("Main model hit its limit, trying " + fallback);
+      const why = fallbackReason(e);
+      if (why && fallback && fallback !== model) {
+        log(why + " (" + e.message + "); trying " + fallback);
+        hooks.onPhase(why + ", trying " + fallback);
         const text = await streamGeminiAttempt({ apiKey, model: fallback, cacheName: null, d, messages, maxOutputTokens, hooks, signal });
-        return { text, model: fallback, usedFallback: true, primary: model };
+        return { text, model: fallback, usedFallback: why, primary: model };
       }
       throw e;
     }
@@ -596,7 +616,7 @@ function createPlugin(pluginID) {
     for (const m of MODEL_SUGGESTIONS) modelList.append(h(doc, "option", { value: m }));
     const modelInput = h(doc, "input", { type: "text", list: "fd-models" });
     const fallbackInput = h(doc, "input", { type: "text", list: "fd-models" });
-    const fallbackLabel = h(doc, "label", { text: "Fallback model when the main one hits its free limit (429). Flash-Lite 3.x models are paid only." }, fallbackInput);
+    const fallbackLabel = h(doc, "label", { text: "Fallback model, used when the main one hits its free limit (429) or is not available to your key" }, fallbackInput);
     const maxCharsInput = h(doc, "input", { type: "number", min: "10000", step: "10000" });
     const maxTokensInput = h(doc, "input", { type: "number", min: "256", step: "256" });
     const thinkingSel = h(doc, "select", {},
@@ -896,7 +916,7 @@ function createPlugin(pluginID) {
         chat.push({ role: "assistant", content: res.text, display: res.text, model: res.model });
         renderMessages();
         const took = "Answered in " + secs() + "s by " + res.model + (res.usedCache ? " (cached paper)" : "") + ".";
-        if (res.usedFallback) setStatus("Main model hit its limit. " + took);
+        if (res.usedFallback) setStatus(res.usedFallback + " (" + res.primary + "). " + took);
         else setStatus(took + (docInfo.truncated ? " The paper text was cut at the character limit." : ""));
       } catch (e) {
         win.clearInterval(ticker);
@@ -1026,18 +1046,18 @@ function createPlugin(pluginID) {
   }
 
   // Saving settings writes the model fields as shown, so anyone who saved an API key under an
-  // earlier version has the old default models stored as if they chose them. Move those (and
-  // only exact old-default values) to the new defaults once.
+  // earlier version has that version's default models stored as if they chose them. Move those
+  // (and only exact old-default values) to the current defaults, once per PREFS_VERSION.
   function migratePrefs() {
     let v;
     try { v = Number(Zotero.Prefs.get(PREF + "prefsVersion", true)) || 0; } catch (e) { v = 0; }
-    if (v >= 2) return;
+    if (v >= PREFS_VERSION) return;
     for (const k of Object.keys(OLD_DEFAULTS)) {
       let cur;
       try { cur = Zotero.Prefs.get(PREF + k, true); } catch (e) { cur = undefined; }
-      if (cur === OLD_DEFAULTS[k]) { setPref(k, DEFAULTS[k]); log("moved " + k + " from " + cur + " to " + DEFAULTS[k]); }
+      if (OLD_DEFAULTS[k].includes(cur)) { setPref(k, DEFAULTS[k]); log("moved " + k + " from " + cur + " to " + DEFAULTS[k]); }
     }
-    setPref("prefsVersion", 2);
+    setPref("prefsVersion", PREFS_VERSION);
   }
 
   return {
