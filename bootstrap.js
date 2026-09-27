@@ -33,11 +33,15 @@ function createPlugin(pluginID) {
   const GEMINI_CACHE_TTL_SECONDS = 3600;
   const DEFAULTS = {
     provider: "gemini",
-    geminiModel: "gemini-3.8-flash",
-    geminiFallback: "gemini-3.5-flash-lite",
+    // Both on Gemini's free tier (with free context caching) as of September 2026. The earlier
+    // defaults were gemini-3.8-flash (free, but slow with thinking) and gemini-3.5-flash-lite
+    // (not on the free tier at all, so the 429 fallback could never succeed on a free key).
+    geminiModel: "gemini-2.5-flash-lite",
+    geminiFallback: "gemini-2.5-flash",
     claudeModel: "claude-sonnet-5",
     maxChars: 120000,
     maxOutputTokens: 2048,
+    geminiThinking: "low",
     panelWidth: 420,
     prompts:
       "Summarize | Summarize this in about 200 words, then list the main claims.\n" +
@@ -45,10 +49,13 @@ function createPlugin(pluginID) {
       "Argument | Reconstruct the argument step by step. Quote the sentence that carries each step.",
   };
   const DEFAULT_EXPLAIN = "Explain what this passage is saying.";
+  // Free-tier models first; the last two are paid-only.
   const MODEL_SUGGESTIONS = [
-    "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash",
+    "gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-3.5-flash", "gemini-3.6-flash",
+    "gemini-3.7-flash", "gemini-3.8-flash", "gemini-2.5-pro",
     "gemini-3.5-flash-lite", "gemini-3.1-flash-lite",
   ];
+  const OLD_DEFAULTS = { geminiModel: "gemini-3.8-flash", geminiFallback: "gemini-3.5-flash-lite" };
 
   const SYSTEM_PROMPT =
     "You are a reading companion for an academic researcher working through difficult texts in philosophy, psychoanalysis and theory. " +
@@ -89,6 +96,11 @@ function createPlugin(pluginID) {
   #fd-root .fd-msgs { flex: 1; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 10px; }
   #fd-root .fd-msg { word-wrap: break-word; padding: 8px 10px; border-radius: 8px; }
   #fd-root .fd-user { background: rgba(128,128,128,.16); white-space: pre-wrap; }
+  #fd-root .fd-quote { white-space: normal; margin-bottom: 6px; padding: 4px 8px; border-left: 3px solid #3b6fd4; font-style: italic;
+    opacity: .85; max-height: 6.2em; overflow: hidden; cursor: pointer; }
+  #fd-root .fd-quote.fd-full { max-height: none; }
+  #fd-root .fd-thinking { opacity: .6; font-style: italic; white-space: pre-wrap; max-height: 9em; overflow: hidden; }
+  #fd-root .fd-thinking-label { opacity: .7; font-size: 12px; margin-bottom: 3px; }
   #fd-root .fd-asst { border: 1px solid rgba(128,128,128,.28); }
   #fd-root .fd-asst .fd-gap { height: 6px; }
   #fd-root .fd-asst .fd-h { font-weight: 700; margin-top: 2px; }
@@ -119,7 +131,9 @@ function createPlugin(pluginID) {
     windows: new Map(),       // window -> api
     busy: false,
     width: 420,
-    geminiCaches: new Map(), // "attId:model:textLen" -> { name, expiresAt }
+    geminiCaches: new Map(), // "attId:model:textLen" -> { name, expiresAt }; name is null when creation failed
+    geminiCachePending: new Map(), // same key -> in-flight background creation
+    noThinking: new Set(),   // Gemini models that rejected thinkingConfig
   };
 
   // ---------- helpers ----------
@@ -227,14 +241,15 @@ function createPlugin(pluginID) {
   }
 
   // ---------- providers ----------
-  // Buffered (non-streaming) HTTP, used only as a fallback if this Zotero build has no `fetch`.
-  async function postJSON(url, headers, body) {
+  // Buffered (non-streaming) HTTP, used only as a fallback if this Zotero build has no `fetch`,
+  // and for Gemini cache creation, which runs in the background and never blocks an answer.
+  async function postJSON(url, headers, body, timeout) {
     try {
       const xhr = await Zotero.HTTP.request("POST", url, {
         headers: Object.assign({ "content-type": "application/json" }, headers),
         body: JSON.stringify(body),
         responseType: "text",
-        timeout: 240000,
+        timeout: timeout || 240000,
       });
       return JSON.parse(xhr.responseText);
     } catch (e) {
@@ -281,7 +296,7 @@ function createPlugin(pluginID) {
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
-      buf += decoder.decode(value, { stream: true });
+      buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
       let idx;
       while ((idx = buf.indexOf("\n\n")) !== -1) {
         const rawEvent = buf.slice(0, idx);
@@ -317,7 +332,7 @@ function createPlugin(pluginID) {
     return text;
   }
 
-  async function streamClaude({ apiKey, model, d, messages, maxOutputTokens, onDelta, signal }) {
+  async function streamClaude({ apiKey, model, d, messages, maxOutputTokens, hooks, signal }) {
     let text = "";
     try {
       await streamSSE(CLAUDE_URL, {
@@ -338,7 +353,7 @@ function createPlugin(pluginID) {
       }, signal, (evt) => {
         if (evt.type === "content_block_delta" && evt.delta && evt.delta.type === "text_delta") {
           text += evt.delta.text;
-          onDelta(evt.delta.text, text);
+          hooks.onDelta(evt.delta.text, text);
         }
       });
     } catch (e) {
@@ -350,33 +365,84 @@ function createPlugin(pluginID) {
   }
 
   // ----- Gemini -----
+  // Gemini 3 models think before answering, and at their default level that can take minutes on a
+  // full paper. The thinking level is a setting (low by default). includeThoughts asks for short
+  // thought summaries, which the panel shows while the model thinks so the wait is visible.
+  // Gemini 2.x takes a token budget instead of a level; 0 turns thinking off (Flash and
+  // Flash-Lite only; 2.5 Pro cannot turn it off, so its floor is 128).
+  function geminiGenConfig(model, maxOutputTokens, useThinking) {
+    const cfg = { maxOutputTokens };
+    if (!useThinking) return cfg;
+    const level = String(getPref("geminiThinking"));
+    if (/^gemini-2\./.test(model)) {
+      const isPro = /pro/.test(model);
+      const budgets = { low: isPro ? 128 : 0, medium: 2048, high: 8192 };
+      if (level in budgets) {
+        cfg.thinkingConfig = { thinkingBudget: budgets[level] };
+        if (budgets[level] > 0) cfg.thinkingConfig.includeThoughts = true;
+      } else {
+        cfg.thinkingConfig = { includeThoughts: true };
+      }
+      return cfg;
+    }
+    cfg.thinkingConfig = { includeThoughts: true };
+    if (level && level !== "default") cfg.thinkingConfig.thinkingLevel = level;
+    return cfg;
+  }
+
+  // Some models reject thinkingConfig (400 naming "thinking"). Retry once without it and
+  // remember the model, so later turns do not pay for the failed request again.
+  async function withThinkingRetry(model, fn) {
+    const useThinking = !state.noThinking.has(model);
+    try {
+      return await fn(useThinking);
+    } catch (e) {
+      if (useThinking && e.status === 400 && !e.partialText && /think/i.test(String(e.message || ""))) {
+        log("Model " + model + " rejected thinkingConfig (" + e.message + "); retrying without it.");
+        state.noThinking.add(model);
+        return fn(false);
+      }
+      throw e;
+    }
+  }
+
   async function createGeminiCache(apiKey, model, d) {
     try {
       const data = await postJSON(GEMINI_ROOT + "cachedContents", { "x-goog-api-key": apiKey }, {
         model: "models/" + model,
         systemInstruction: { parts: [{ text: SYSTEM_PROMPT + "\n\n" + docBlockOf(d) }] },
         ttl: GEMINI_CACHE_TTL_SECONDS + "s",
-      });
+      }, 90000);
       return data && data.name ? data.name : null;
     } catch (e) {
-      // Common and harmless: very short papers fall under Gemini's minimum cacheable size.
+      // Common and harmless: very short papers fall under Gemini's minimum cacheable size,
+      // and some free-tier models do not offer explicit caching at all.
       log("Gemini cache not created (" + (e && e.message) + "); sending the paper text inline instead.");
       return null;
     }
   }
 
-  async function getOrCreateGeminiCache(apiKey, model, att, d) {
-    const key = att.id + ":" + model + ":" + d.text.length;
+  function geminiCacheKey(att, model, d) { return att.id + ":" + model + ":" + d.text.length; }
+
+  // Returns a usable cache name right now, or null. Never waits on the network: if there is no
+  // cache yet, it starts creating one in the background for the next question and this question
+  // goes out with the paper inline. A failed creation is remembered for the same hour a cache
+  // would have lived, so it is not retried on every turn.
+  function geminiCacheNow(apiKey, model, att, d) {
+    const key = geminiCacheKey(att, model, d);
     const entry = state.geminiCaches.get(key);
     if (entry && Date.now() < entry.expiresAt) return entry.name;
-    const name = await createGeminiCache(apiKey, model, d);
-    if (name) state.geminiCaches.set(key, { name, expiresAt: Date.now() + (GEMINI_CACHE_TTL_SECONDS - 300) * 1000 });
-    else state.geminiCaches.delete(key);
-    return name;
+    if (!state.geminiCachePending.has(key)) {
+      const p = createGeminiCache(apiKey, model, d).then((name) => {
+        state.geminiCaches.set(key, { name, expiresAt: Date.now() + (GEMINI_CACHE_TTL_SECONDS - 300) * 1000 });
+      }).catch(() => {}).finally(() => state.geminiCachePending.delete(key));
+      state.geminiCachePending.set(key, p);
+    }
+    return null;
   }
 
   function forgetGeminiCache(att, model, d) {
-    state.geminiCaches.delete(att.id + ":" + model + ":" + d.text.length);
+    state.geminiCaches.delete(geminiCacheKey(att, model, d));
   }
 
   function geminiContentsOf(messages) {
@@ -384,11 +450,12 @@ function createPlugin(pluginID) {
   }
 
   async function geminiOnceBuffered({ apiKey, model, d, messages, maxOutputTokens }) {
-    const data = await postJSON(GEMINI_BASE + encodeURIComponent(model) + ":generateContent", { "x-goog-api-key": apiKey }, {
-      systemInstruction: { parts: [{ text: SYSTEM_PROMPT + "\n\n" + docBlockOf(d) }] },
-      contents: geminiContentsOf(messages),
-      generationConfig: { maxOutputTokens },
-    });
+    const data = await withThinkingRetry(model, (useThinking) =>
+      postJSON(GEMINI_BASE + encodeURIComponent(model) + ":generateContent", { "x-goog-api-key": apiKey }, {
+        systemInstruction: { parts: [{ text: SYSTEM_PROMPT + "\n\n" + docBlockOf(d) }] },
+        contents: geminiContentsOf(messages),
+        generationConfig: geminiGenConfig(model, maxOutputTokens, useThinking),
+      }));
     const cand = data.candidates && data.candidates[0];
     const text = cand && cand.content && cand.content.parts
       ? cand.content.parts.filter((p) => p.text && !p.thought).map((p) => p.text).join("")
@@ -412,45 +479,54 @@ function createPlugin(pluginID) {
     }
   }
 
-  async function streamGeminiAttempt({ apiKey, model, cacheName, d, messages, maxOutputTokens, onDelta, signal }) {
+  async function streamGeminiAttempt({ apiKey, model, cacheName, d, messages, maxOutputTokens, hooks, signal }) {
     const url = GEMINI_BASE + encodeURIComponent(model) + ":streamGenerateContent?alt=sse";
-    const body = { generationConfig: { maxOutputTokens }, contents: geminiContentsOf(messages) };
-    if (cacheName) body.cachedContent = cacheName;
-    else body.systemInstruction = { parts: [{ text: SYSTEM_PROMPT + "\n\n" + docBlockOf(d) }] };
-    let text = "";
-    try {
-      await streamSSE(url, { "x-goog-api-key": apiKey }, body, signal, (evt) => {
-        const cand = evt.candidates && evt.candidates[0];
-        const parts = cand && cand.content && cand.content.parts;
-        if (!parts) return;
-        for (const p of parts) {
-          if (p.text && !p.thought) { text += p.text; onDelta(p.text, text); }
-        }
-      });
-    } catch (e) {
-      if (text) throw mkError(e && e.message, { name: e && e.name, status: e && e.status, partialText: text });
-      throw e;
-    }
-    if (!text) throw new Error("Gemini returned no text.");
-    return text;
+    return withThinkingRetry(model, async (useThinking) => {
+      const body = { generationConfig: geminiGenConfig(model, maxOutputTokens, useThinking), contents: geminiContentsOf(messages) };
+      if (cacheName) body.cachedContent = cacheName;
+      else body.systemInstruction = { parts: [{ text: SYSTEM_PROMPT + "\n\n" + docBlockOf(d) }] };
+      let text = "", thought = "", finish = "";
+      try {
+        await streamSSE(url, { "x-goog-api-key": apiKey }, body, signal, (evt) => {
+          const cand = evt.candidates && evt.candidates[0];
+          if (cand && cand.finishReason) finish = cand.finishReason;
+          const parts = cand && cand.content && cand.content.parts;
+          if (!parts) return;
+          for (const p of parts) {
+            if (!p.text) continue;
+            if (p.thought) { thought += p.text; hooks.onThought(thought); }
+            else { text += p.text; hooks.onDelta(p.text, text); }
+          }
+        });
+      } catch (e) {
+        if (text) throw mkError(e && e.message, { name: e && e.name, status: e && e.status, partialText: text });
+        throw e;
+      }
+      if (!text) {
+        throw new Error("Gemini returned no text" + (finish ? " (" + finish + ")" : "") +
+          (finish === "MAX_TOKENS" ? ". Thinking used up the reply length; raise Max reply length or lower thinking in settings." : "."));
+      }
+      return text;
+    });
   }
 
-  async function streamGemini({ apiKey, model, fallback, att, d, messages, maxOutputTokens, onDelta, signal }) {
+  async function streamGemini({ apiKey, model, fallback, att, d, messages, maxOutputTokens, hooks, signal }) {
     let cache = null;
-    try { cache = await getOrCreateGeminiCache(apiKey, model, att, d); } catch (e) { /* proceed without cache */ }
+    try { cache = geminiCacheNow(apiKey, model, att, d); } catch (e) { /* proceed without cache */ }
 
     try {
-      const text = await streamGeminiAttempt({ apiKey, model, cacheName: cache, d, messages, maxOutputTokens, onDelta, signal });
-      return { text, model };
+      const text = await streamGeminiAttempt({ apiKey, model, cacheName: cache, d, messages, maxOutputTokens, hooks, signal });
+      return { text, model, usedCache: !!cache };
     } catch (e) {
       // A cache can outlive our bookkeeping (evicted early, etc). Retry once with the paper sent inline.
       if (cache && !e.partialText && /cach/i.test(String(e.message || ""))) {
         forgetGeminiCache(att, model, d);
-        const text = await streamGeminiAttempt({ apiKey, model, cacheName: null, d, messages, maxOutputTokens, onDelta, signal });
+        const text = await streamGeminiAttempt({ apiKey, model, cacheName: null, d, messages, maxOutputTokens, hooks, signal });
         return { text, model };
       }
       if (e.status === 429 && fallback && fallback !== model && !e.partialText) {
-        const text = await streamGeminiAttempt({ apiKey, model: fallback, cacheName: null, d, messages, maxOutputTokens, onDelta, signal });
+        hooks.onPhase("Main model hit its limit, trying " + fallback);
+        const text = await streamGeminiAttempt({ apiKey, model: fallback, cacheName: null, d, messages, maxOutputTokens, hooks, signal });
         return { text, model: fallback, usedFallback: true, primary: model };
       }
       throw e;
@@ -459,7 +535,8 @@ function createPlugin(pluginID) {
 
   // Streams when this Zotero build has `fetch` (expected on Zotero 7+); otherwise falls back
   // to a single buffered request so the plugin still works, just without live text.
-  async function streamAsk(d, chat, att, onDelta, signal) {
+  // hooks: { onDelta(chunk, fullText), onThought(fullThoughtSummary), onPhase(label) }
+  async function streamAsk(d, chat, att, hooks, signal) {
     const provider = String(getPref("provider"));
     const apiKey = String(getPref(keyPrefName(provider)) || "").trim();
     const model = String(getPref(modelPrefName(provider)));
@@ -467,11 +544,14 @@ function createPlugin(pluginID) {
     const messages = chat.map((m) => ({ role: m.role, content: m.content }));
 
     if (typeof fetch !== "function") {
+      log("fetch is not available here; using a buffered request (no live text).");
+      hooks.onPhase("Waiting for the full answer from " + model + " (live text is not available in this Zotero build)");
       if (provider === "claude") return { text: await callClaudeBuffered({ apiKey, model, d, messages, maxOutputTokens }), model };
       return callGeminiBuffered({ apiKey, model, fallback: String(getPref("geminiFallback")), d, messages, maxOutputTokens });
     }
-    if (provider === "claude") return streamClaude({ apiKey, model, d, messages, maxOutputTokens, onDelta, signal });
-    return streamGemini({ apiKey, model, fallback: String(getPref("geminiFallback")), att, d, messages, maxOutputTokens, onDelta, signal });
+    hooks.onPhase("Waiting for " + model);
+    if (provider === "claude") return streamClaude({ apiKey, model, d, messages, maxOutputTokens, hooks, signal });
+    return streamGemini({ apiKey, model, fallback: String(getPref("geminiFallback")), att, d, messages, maxOutputTokens, hooks, signal });
   }
 
   // ---------- notes ----------
@@ -516,9 +596,15 @@ function createPlugin(pluginID) {
     for (const m of MODEL_SUGGESTIONS) modelList.append(h(doc, "option", { value: m }));
     const modelInput = h(doc, "input", { type: "text", list: "fd-models" });
     const fallbackInput = h(doc, "input", { type: "text", list: "fd-models" });
-    const fallbackLabel = h(doc, "label", { text: "Fallback model when the main one hits its free limit (429)" }, fallbackInput);
+    const fallbackLabel = h(doc, "label", { text: "Fallback model when the main one hits its free limit (429). Flash-Lite 3.x models are paid only." }, fallbackInput);
     const maxCharsInput = h(doc, "input", { type: "number", min: "10000", step: "10000" });
     const maxTokensInput = h(doc, "input", { type: "number", min: "256", step: "256" });
+    const thinkingSel = h(doc, "select", {},
+      h(doc, "option", { value: "low", text: "Low (fastest)" }),
+      h(doc, "option", { value: "medium", text: "Medium" }),
+      h(doc, "option", { value: "high", text: "High (slowest, most careful)" }),
+      h(doc, "option", { value: "default", text: "Model default" }));
+    const thinkingLabel = h(doc, "label", { text: "Gemini thinking before answering" }, thinkingSel);
     const promptsInput = h(doc, "textarea", { rows: "5", placeholder: "Label | prompt   (one per line)" });
     const keyHint = h(doc, "div", { class: "fd-hint" });
     const saveBtn = h(doc, "button", { class: "fd-send", text: "Save" });
@@ -528,6 +614,7 @@ function createPlugin(pluginID) {
       keyHint,
       h(doc, "label", { text: "Model" }, modelInput), modelList,
       fallbackLabel,
+      thinkingLabel,
       h(doc, "label", { text: "Prompt buttons, one per line as: Label | prompt" }, promptsInput),
       h(doc, "label", { text: "Max characters of paper text sent (lower reads faster and costs less)" }, maxCharsInput),
       h(doc, "label", { text: "Max reply length in tokens (lower answers faster and costs less)" }, maxTokensInput),
@@ -597,6 +684,8 @@ function createPlugin(pluginID) {
       modelInput.value = String(getPref(modelPrefName(provider)));
       fallbackInput.value = String(getPref("geminiFallback"));
       fallbackLabel.style.display = provider === "gemini" ? "" : "none";
+      thinkingLabel.style.display = provider === "gemini" ? "" : "none";
+      thinkingSel.value = String(getPref("geminiThinking"));
       keyHint.textContent = provider === "gemini"
         ? "Free key: aistudio.google.com/apikey. Daily and per-minute limits depend on the model; check yours in AI Studio."
         : "Key from console.anthropic.com. API use is billed separately from a claude.ai plan.";
@@ -624,7 +713,14 @@ function createPlugin(pluginID) {
       }
       for (const m of chat) {
         if (m.role === "user") {
-          msgs.append(h(doc, "div", { class: "fd-msg fd-user", text: m.display || m.content }));
+          const box = h(doc, "div", { class: "fd-msg fd-user" });
+          if (m.passage) {
+            const quote = h(doc, "div", { class: "fd-quote", title: "Click to show the whole passage", text: m.passage.replace(/\s+/g, " ").trim() });
+            quote.addEventListener("click", () => quote.classList.toggle("fd-full"));
+            box.append(quote);
+          }
+          box.append(h(doc, "div", { text: m.display || m.content }));
+          msgs.append(box);
         } else {
           const box = h(doc, "div", { class: "fd-msg fd-asst" });
           renderMarkdown(doc, box, m.content);
@@ -732,44 +828,78 @@ function createPlugin(pluginID) {
 
       state.busy = true;
       setSending(true);
-      setStatus("Reading the text...");
       let chat = state.chats.get(att.id);
       if (!chat) { chat = []; state.chats.set(att.id, chat); }
 
-      let content = question, display = question, usedSelection = false;
+      let content = question, display = question, passage = null;
       if (hasSel) {
-        content = 'Selected passage:\n"""\n' + state.selection.text + '\n"""\n\n' + question;
-        display = "[Selected passage attached]\n" + question;
-        usedSelection = true;
+        passage = state.selection.text;
+        content = 'Selected passage:\n"""\n' + passage + '\n"""\n\n' + question;
       }
-      chat.push({ role: "user", content, display });
+      chat.push({ role: "user", content, display, passage });
       input.value = "";
-      if (usedSelection) { state.selection = null; renderSelection(); } // it now lives in the chat history
+      if (passage) { state.selection = null; renderSelection(); } // it now lives in the chat history
       renderMessages();
 
       // A live bubble the streamed answer fills in as it arrives, ahead of state.chats,
-      // which only gets the finished text once the stream ends.
+      // which only gets the finished text once the stream ends. Until the first answer word
+      // it shows the current phase and, for Gemini, the model's thought summaries.
+      const liveLabel = h(doc, "div", { class: "fd-thinking-label", text: "Reading the text..." });
+      const liveThought = h(doc, "div", { class: "fd-thinking" });
       const liveInner = h(doc, "div", { class: "fd-live-text" });
-      const liveBox = h(doc, "div", { class: "fd-msg fd-asst" }, liveInner);
+      const liveBox = h(doc, "div", { class: "fd-msg fd-asst" }, liveLabel, liveThought, liveInner);
       msgs.append(liveBox);
       msgs.scrollTop = msgs.scrollHeight;
-      const onDelta = (_chunk, full) => {
-        setStatus("Answering...");
-        liveInner.textContent = full;
-        liveInner.append(h(doc, "span", { class: "fd-cursor", text: "\u258c" }));
-        msgs.scrollTop = msgs.scrollHeight;
+
+      // Status line: current phase plus elapsed seconds, ticking even while nothing arrives,
+      // so a slow step is visible as slow rather than looking frozen.
+      const started = Date.now();
+      let phase = "Reading the text", answering = false;
+      const secs = () => Math.round((Date.now() - started) / 1000);
+      const tick = () => { if (!answering) setStatus(phase + "... " + secs() + "s"); };
+      const setPhase = (p) => {
+        log("phase at " + secs() + "s: " + p);
+        phase = p;
+        liveLabel.textContent = p + "...";
+        tick();
+      };
+      tick();
+      const ticker = win.setInterval(tick, 1000);
+      const hooks = {
+        onPhase: setPhase,
+        onThought: (full) => {
+          if (answering) return;
+          if (phase !== "Thinking") setPhase("Thinking");
+          liveThought.textContent = full.length > 700 ? "..." + full.slice(-700) : full;
+          msgs.scrollTop = msgs.scrollHeight;
+        },
+        onDelta: (_chunk, full) => {
+          if (!answering) {
+            answering = true;
+            log("first answer text at " + secs() + "s");
+            liveLabel.remove();
+            liveThought.remove();
+            setStatus("Answering...");
+          }
+          liveInner.textContent = full;
+          liveInner.append(h(doc, "span", { class: "fd-cursor", text: "\u258c" }));
+          msgs.scrollTop = msgs.scrollHeight;
+        },
       };
 
       const abort = typeof AbortController === "function" ? new AbortController() : null;
       currentAbort = abort;
       try {
         const docInfo = await loadDocument(att);
-        const res = await streamAsk(docInfo, chat, att, onDelta, abort && abort.signal);
+        const res = await streamAsk(docInfo, chat, att, hooks, abort && abort.signal);
+        win.clearInterval(ticker);
         chat.push({ role: "assistant", content: res.text, display: res.text, model: res.model });
         renderMessages();
-        if (res.usedFallback) setStatus("Main model hit its limit; answered with " + res.model + ".");
-        else setStatus(docInfo.truncated ? "Note: the paper text was cut at the character limit." : "");
+        const took = "Answered in " + secs() + "s by " + res.model + (res.usedCache ? " (cached paper)" : "") + ".";
+        if (res.usedFallback) setStatus("Main model hit its limit. " + took);
+        else setStatus(took + (docInfo.truncated ? " The paper text was cut at the character limit." : ""));
       } catch (e) {
+        win.clearInterval(ticker);
         liveBox.remove();
         if (e && e.name === "AbortError" && e.partialText) {
           chat.push({ role: "assistant", content: e.partialText, display: e.partialText, model: "stopped early" });
@@ -788,6 +918,7 @@ function createPlugin(pluginID) {
           setStatus(msg, true);
         }
       } finally {
+        win.clearInterval(ticker);
         state.busy = false;
         setSending(false);
         currentAbort = null;
@@ -807,13 +938,17 @@ function createPlugin(pluginID) {
       setPref("provider", provider);
       setPref(keyPrefName(provider), keyInput.value.trim());
       setPref(modelPrefName(provider), modelInput.value.trim() || DEFAULTS[modelPrefName(provider)]);
-      if (provider === "gemini") setPref("geminiFallback", fallbackInput.value.trim());
+      if (provider === "gemini") {
+        setPref("geminiFallback", fallbackInput.value.trim());
+        setPref("geminiThinking", thinkingSel.value);
+      }
       setPref("maxChars", Number(maxCharsInput.value) || DEFAULTS.maxChars);
       setPref("maxOutputTokens", Number(maxTokensInput.value) || DEFAULTS.maxOutputTokens);
       setPref("prompts", promptsInput.value.trim() || " "); // a single space means "no prompt buttons"
       renderQuick();
       state.docs.clear(); // text limit may have changed, so cached Gemini content built on the old text is stale too
       state.geminiCaches.clear();
+      state.noThinking.clear();
       settings.classList.remove("fd-open");
       setStatus("Settings saved.");
     });
@@ -890,8 +1025,24 @@ function createPlugin(pluginID) {
     append(btn);
   }
 
+  // Saving settings writes the model fields as shown, so anyone who saved an API key under an
+  // earlier version has the old default models stored as if they chose them. Move those (and
+  // only exact old-default values) to the new defaults once.
+  function migratePrefs() {
+    let v;
+    try { v = Number(Zotero.Prefs.get(PREF + "prefsVersion", true)) || 0; } catch (e) { v = 0; }
+    if (v >= 2) return;
+    for (const k of Object.keys(OLD_DEFAULTS)) {
+      let cur;
+      try { cur = Zotero.Prefs.get(PREF + k, true); } catch (e) { cur = undefined; }
+      if (cur === OLD_DEFAULTS[k]) { setPref(k, DEFAULTS[k]); log("moved " + k + " from " + cur + " to " + DEFAULTS[k]); }
+    }
+    setPref("prefsVersion", 2);
+  }
+
   return {
     init() {
+      migratePrefs();
       Zotero.Reader.registerEventListener("renderTextSelectionPopup", onSelectionPopup, pluginID);
       for (const win of Zotero.getMainWindows()) addToWindow(win);
     },

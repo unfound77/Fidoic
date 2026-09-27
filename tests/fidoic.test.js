@@ -19,7 +19,7 @@ const prefs = {};
 const httpCalls = [];
 const fetchCalls = [];
 const registered = {};
-const mode = { cacheFails: false, rateLimit429: false, badCacheOnce: false, geminiEvents: null, claudeEvents: null };
+const mode = { cacheFails: false, rateLimit429: false, badCacheOnce: false, rejectThinking: false, geminiEvents: null, claudeEvents: null };
 
 function abortableDelay(ms, signal) {
   return new Promise((resolve, reject) => {
@@ -34,6 +34,7 @@ function sseStream(events, signal) {
     async start(controller) {
       for (const evt of events) {
         if (evt === "__HANG__") { await abortableDelay(24 * 60 * 60 * 1000, signal); continue; }
+        if (evt === "__PAUSE__") { await abortableDelay(60, signal); continue; }
         await abortableDelay(4, signal);
         controller.enqueue(encoder.encode("data: " + JSON.stringify(evt) + "\n\n"));
       }
@@ -64,8 +65,11 @@ global.Zotero = {
 global.fetch = async (url, opts) => {
   const body = JSON.parse(opts.body);
   fetchCalls.push({ url, body, headers: opts.headers });
-  if (mode.rateLimit429 && url.includes("gemini-3.8-flash:")) {
+  if (mode.rateLimit429 && url.includes("gemini-2.5-flash-lite:")) {
     return { ok: false, status: 429, body: null, text: async () => JSON.stringify({ error: { message: "Quota exceeded" } }) };
+  }
+  if (mode.rejectThinking && body.generationConfig && body.generationConfig.thinkingConfig) {
+    return { ok: false, status: 400, body: null, text: async () => JSON.stringify({ error: { message: "Thinking level is not supported for this model." } }) };
   }
   if (mode.badCacheOnce && body.cachedContent) {
     mode.badCacheOnce = false;
@@ -95,7 +99,7 @@ async function freshSession() {
   win = makeWin();
   prefs["extensions.fidoic.provider"] = undefined; delete prefs["extensions.fidoic.provider"];
   prefs["extensions.fidoic.geminiKey"] = "AIza-test";
-  mode.geminiEvents = null; mode.claudeEvents = null; mode.rateLimit429 = false; mode.badCacheOnce = false; mode.cacheFails = false;
+  mode.geminiEvents = null; mode.claudeEvents = null; mode.rateLimit429 = false; mode.badCacheOnce = false; mode.cacheFails = false; mode.rejectThinking = false;
   fetchCalls.length = 0; httpCalls.length = 0;
   await __b.startup({ id: "fidoic@local.invalid" });
   const d = win.document;
@@ -108,17 +112,33 @@ async function freshSession() {
   // ===== SESSION A: streaming, caching, fallback, abort, provider switch =====
   let d = await freshSession();
 
+  // first turn: thought summaries stream before the answer and must show live, then vanish
+  mode.geminiEvents = [
+    { candidates: [{ content: { parts: [{ text: "Considering the signifier.", thought: true }] } }] },
+    "__PAUSE__",
+    { candidates: [{ content: { parts: [{ text: "The " }] } }] },
+    { candidates: [{ content: { parts: [{ text: "letter " }] } }] },
+    { candidates: [{ content: { parts: [{ text: "arrives." }] }, finishReason: "STOP" }] },
+  ];
   d.querySelector(".fd-compose textarea").value = "What does the letter do?";
   d.querySelector(".fd-compose .fd-send").click();
   await wait(10);
   ok("stop button shows while streaming", d.querySelector(".fd-stop").style.display !== "none");
-  await wait(60);
-  ok("cache created on first turn", httpCalls.filter((c) => c.url.endsWith("/cachedContents")).length === 1);
+  ok("status shows a phase with elapsed seconds before any text", /\.\.\. \d+s$/.test(d.querySelector(".fd-status").textContent));
+  await wait(30);
+  ok("thought summary shown live while thinking", /Considering the signifier/.test(d.querySelector(".fd-thinking") && d.querySelector(".fd-thinking").textContent) && /^Thinking/.test(d.querySelector(".fd-status").textContent));
+  await wait(160);
+  mode.geminiEvents = null;
   let gc1 = fetchCalls[fetchCalls.length - 1];
-  ok("first gemini call uses the cache, no inline doc", gc1.body.cachedContent === "cachedContents/abc123" && !gc1.body.systemInstruction);
-  ok("streamed text assembled correctly", [...d.querySelectorAll(".fd-asst")][0].textContent.includes("The letter arrives."));
+  ok("first gemini call sends the paper inline without waiting for a cache", !gc1.body.cachedContent && gc1.body.systemInstruction.parts[0].text.includes("<document>"));
+  ok("cache is created in the background on the first turn", httpCalls.filter((c) => c.url.endsWith("/cachedContents")).length === 1);
+  const firstAnswer = [...d.querySelectorAll(".fd-asst")][0].textContent;
+  ok("streamed text assembled correctly", firstAnswer.includes("The letter arrives."));
+  ok("thought summary is not part of the final answer", !firstAnswer.includes("Considering") && !d.querySelector(".fd-thinking"));
   ok("stop button hidden again after completion", d.querySelector(".fd-stop").style.display === "none");
+  ok("status reports how long the answer took", /^Answered in \d+s by gemini-2.5-flash-lite/.test(d.querySelector(".fd-status").textContent));
   ok("gemini generationConfig used the configured token cap", gc1.body.generationConfig.maxOutputTokens === 2048);
+  ok("gemini 2.5 on low thinking sends a zero thinking budget", gc1.body.generationConfig.thinkingConfig.thinkingBudget === 0 && !gc1.body.generationConfig.thinkingConfig.thinkingLevel);
 
   d.querySelector(".fd-compose textarea").value = "And why?";
   d.querySelector(".fd-compose .fd-send").click();
@@ -127,6 +147,7 @@ async function freshSession() {
   let gc2 = fetchCalls[fetchCalls.length - 1];
   ok("second turn still references the cache", gc2.body.cachedContent === "cachedContents/abc123");
   ok("second turn conversation includes prior turns", gc2.body.contents.length === 3);
+  ok("status says the cached paper was used", /\(cached paper\)/.test(d.querySelector(".fd-status").textContent));
 
   mode.badCacheOnce = true;
   d.querySelector(".fd-compose textarea").value = "One more?";
@@ -141,8 +162,8 @@ async function freshSession() {
   d.querySelector(".fd-compose .fd-send").click();
   await wait(80);
   mode.rateLimit429 = false;
-  ok("429 falls back to the lighter model", fetchCalls[fetchCalls.length - 1].url.includes("gemini-3.5-flash-lite:"));
-  ok("status line names the fallback model", /answered with gemini-3.5-flash-lite/.test(d.querySelector(".fd-status").textContent));
+  ok("429 falls back to the lighter model", fetchCalls[fetchCalls.length - 1].url.includes("gemini-2.5-flash:"));
+  ok("status line names the fallback model", /Answered in \d+s by gemini-2.5-flash/.test(d.querySelector(".fd-status").textContent));
 
   mode.geminiEvents = [{ candidates: [{ content: { parts: [{ text: "Partial " }] } }] }, "__HANG__"];
   d.querySelector(".fd-compose textarea").value = "Long one";
@@ -189,6 +210,10 @@ async function freshSession() {
   let last = fetchCalls[fetchCalls.length - 1];
   let lastText = () => last.body.contents.slice(-1)[0].parts[0].text;
   ok("popup with empty box explains the selection", fetchCalls.length === 1 && lastText().includes("the letter always arrives") && lastText().endsWith("Explain what this passage is saying."));
+  const firstUser = d.querySelector(".fd-user");
+  ok("selected passage is shown in the question bubble", !!firstUser.querySelector(".fd-quote") && firstUser.querySelector(".fd-quote").textContent === "the letter always arrives" && !/Selected passage attached/.test(firstUser.textContent));
+  firstUser.querySelector(".fd-quote").click();
+  ok("clicking the passage expands it", firstUser.querySelector(".fd-quote").classList.contains("fd-full"));
 
   d.querySelector(".fd-compose textarea").value = "Why does it always arrive?";
   registered.renderTextSelectionPopup({ reader: { itemID: 7 }, doc: d, params: { annotation: { text: "passage two" } }, append: (e) => (popupBtn = e) });
@@ -198,6 +223,8 @@ async function freshSession() {
   ok("popup with a typed prompt uses it", lastText().endsWith("Why does it always arrive?"));
 
   const qbtns = () => [...d.querySelectorAll(".fd-quick button")];
+  const typed = [...d.querySelectorAll(".fd-user")].pop();
+  ok("typed question shown under its passage", typed.querySelector(".fd-quote").textContent === "passage two" && typed.textContent.endsWith("Why does it always arrive?"));
   qbtns()[0].click();
   await wait(60);
   last = fetchCalls[fetchCalls.length - 1];
@@ -215,6 +242,20 @@ async function freshSession() {
   d.querySelector(".fd-settings .fd-send").click();
   ok("custom prompt buttons replace the defaults", qbtns().map((b) => b.textContent).join(",") === "Plain");
 
+  // a model that rejects thinkingConfig: retried once without it, then remembered
+  mode.rejectThinking = true;
+  const before = fetchCalls.length;
+  d.querySelector(".fd-compose textarea").value = "Thinking rejected?";
+  d.querySelector(".fd-compose .fd-send").click();
+  await wait(80);
+  const tr = fetchCalls.slice(before);
+  ok("thinkingConfig rejection retried without it", tr.length === 2 && !!tr[0].body.generationConfig.thinkingConfig && !tr[1].body.generationConfig.thinkingConfig && /Thinking rejected/.test(d.querySelector(".fd-msgs").textContent) && d.querySelectorAll(".fd-user").length === d.querySelectorAll(".fd-asst").length);
+  d.querySelector(".fd-compose textarea").value = "And again?";
+  d.querySelector(".fd-compose .fd-send").click();
+  await wait(80);
+  ok("rejecting model not sent thinkingConfig again", fetchCalls.length === before + 3 && !fetchCalls[fetchCalls.length - 1].body.generationConfig.thinkingConfig);
+  mode.rejectThinking = false;
+
   const noTextAtt = { id: 42, libraryID: 1, parentItemID: null, isAttachment: () => true, isRegularItem: () => false, parentItem: null, getDisplayTitle: () => "Scan", get attachmentText() { return Promise.resolve("   "); } };
   Zotero.Items.get = (id) => (id === 42 ? noTextAtt : att);
   Zotero.Reader.getByTabID = () => ({ itemID: 42 });
@@ -225,4 +266,21 @@ async function freshSession() {
 
   __b.shutdown();
   ok("session B cleans up", !d.getElementById("fd-root"));
+
+  // ===== SESSION C: old saved defaults migrate once; Gemini 3 models get a thinking level =====
+  for (const k of Object.keys(prefs)) delete prefs[k];
+  prefs["extensions.fidoic.geminiModel"] = "gemini-3.8-flash";
+  prefs["extensions.fidoic.geminiFallback"] = "gemini-3.5-flash-lite";
+  d = await freshSession();
+  ok("saved old default models migrate to the free-tier defaults", prefs["extensions.fidoic.geminiModel"] === "gemini-2.5-flash-lite" && prefs["extensions.fidoic.geminiFallback"] === "gemini-2.5-flash");
+  __b.shutdown();
+  prefs["extensions.fidoic.geminiModel"] = "gemini-3.8-flash";
+  d = await freshSession();
+  ok("a model chosen after migration is left alone", prefs["extensions.fidoic.geminiModel"] === "gemini-3.8-flash");
+  d.querySelector(".fd-compose textarea").value = "Level?";
+  d.querySelector(".fd-compose .fd-send").click();
+  await wait(80);
+  const g3 = fetchCalls[fetchCalls.length - 1].body.generationConfig.thinkingConfig;
+  ok("gemini 3 on low thinking sends thinkingLevel low with summaries", g3.thinkingLevel === "low" && g3.includeThoughts === true && g3.thinkingBudget === undefined);
+  __b.shutdown();
 })().catch((e) => { console.error("ERROR", e); process.exitCode = 1; });
