@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.2
+- Docs renamed to "Fidoic-AI Assistant for Zotero PDFs". The plugin itself is unchanged and
+  still shows as fidoic in Zotero.
+- The built file is now `fidoic.xpi`, with no version number in the name.
+- The release workflow runs the test suite before building, and can publish releases.
+
 ## 0.5.1
 - Default Gemini models are now `gemini-3.5-flash-lite`, falling back to `gemini-3.5-flash`.
   0.5.0's defaults (the 2.5 models) are closed to new API keys and failed with "no longer

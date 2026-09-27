@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
   "name": "fidoic",
-  "version": "0.5.1",
-  "description": "fidoic: a docked reading companion for the PDF open in Zotero. Reads the paper automatically. Works with the free Gemini API tier or with Claude.",
+  "version": "0.5.2",
+  "description": "Fidoic-AI Assistant for Zotero PDFs: a docked reading companion for the PDF open in Zotero. Reads the paper automatically. Works with the free Gemini API tier or with Claude.",
   "author": "fidoic",
   "icons": {
     "48": "icon.svg",

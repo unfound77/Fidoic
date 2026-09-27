@@ -1,4 +1,4 @@
-# CLAUDE.md — context for continuing fidoic in Claude Code
+# CLAUDE.md: context for continuing fidoic in Claude Code
 
 This file exists so a fresh Claude Code session has the background a chat-based session
 built up over several iterations. Read this before making changes; it records decisions,
@@ -7,7 +7,8 @@ made once.
 
 ## What this project is
 
-fidoic is a Zotero plugin: a docked chat panel beside the PDF reader that answers questions
+fidoic (public name in docs: "Fidoic-AI Assistant for Zotero PDFs"; everything inside the
+plugin UI stays plain "fidoic") is a Zotero plugin: a docked chat panel beside the PDF reader that answers questions
 about the paper you have open, using your own Gemini or Claude API key. It grew out of a
 request to build something like Microsoft Edge's Copilot sidebar, but for Zotero: page-aware
 with no clicks, select text and ask about it, no compose or rewrite mode, nothing beyond a
@@ -22,7 +23,7 @@ test harness under `tests/`; they are never packaged into the `.xpi`.
 ```bash
 npm install                 # once, for the test harness (jsdom)
 npm test                    # runs tests/fidoic.test.js
-zip -X fidoic-X.Y.Z.xpi manifest.json bootstrap.js icon.svg   # the actual deliverable
+zip -X fidoic.xpi manifest.json bootstrap.js icon.svg   # the actual deliverable, always named fidoic.xpi
 ```
 
 **The test suite has never touched a real Zotero.** It mocks `Zotero`, a jsdom `window`, and
@@ -227,7 +228,7 @@ bootstrap.js
 icon.svg
 tests/fidoic.test.js       # mocked Zotero/DOM/network regression suite (45 checks)
 package.json               # dev-only, for running tests/fidoic.test.js
-.github/workflows/release.yml   # builds + releases the .xpi on a vX.Y.Z tag push
+.github/workflows/release.yml   # on a vX.Y.Z tag push: runs tests, builds fidoic.xpi, publishes a release
 README.md, CHANGELOG.md, LICENSE (MIT)
 ```
 
